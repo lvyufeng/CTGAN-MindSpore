@@ -7,7 +7,7 @@ from ctgan.ctgan import CTGANSynthesizer
 def test_ctgan():
     # ## Credit数据集
 
-    train = pd.read_csv("~/Downloads/ctgan_test/creditcard.csv")
+    train = pd.read_csv("tests/creditcard.csv")
     train.info()
 
     # ### 100000条数据
@@ -17,7 +17,7 @@ def test_ctgan():
     train_10w.info()
     print(train_10w.shape[1])
 
-    model = CTGANSynthesizer(batch_size=500, epochs=50, verbose=True)
+    model = CTGANSynthesizer(batch_size=500, epochs=50, verbose=True, amp=True)
 
 
     print("----------Train----------")

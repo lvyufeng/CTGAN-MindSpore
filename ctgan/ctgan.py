@@ -9,13 +9,14 @@ from mindspore import Tensor, ms_function
 from .data_modules import DataTransformer, DataSampler
 from .modules import Generator, Discriminator, conditional_loss
 from .grad import value_and_grad, grad
+from .amp import DynamicLossScale, NoLossScale, all_finite, auto_mixed_precision
 
-class CTGANSynthesizer():
+class CTGANSynthesizer(nn.Cell):
     def __init__(self, embedding_dim=128, generator_dim=(256, 256), discriminator_dim=(256, 256),
                  generator_lr=2e-4, generator_decay=1e-6, discriminator_lr=2e-4,
                  discriminator_decay=1e-6, batch_size=500, discriminator_steps=1,
-                 log_frequency=True, verbose=False, epochs=300, pac=10):
-
+                 log_frequency=True, verbose=False, epochs=300, pac=10, amp=False):
+        super().__init__()
         assert batch_size % 2 == 0
 
         self._embedding_dim = embedding_dim
@@ -33,10 +34,67 @@ class CTGANSynthesizer():
         self._verbose = verbose
         self._epochs = epochs
         self.pac = pac
+        self.amp = amp
 
         self._transformer = None
         self._data_sampler = None
         self._generator = None
+
+    def calc_gradient_penalty(self, real_data, fake_data, pac=10, lambda_=10):
+        """Compute the gradient penalty."""
+        alpha = ops.StandardNormal()((real_data.shape[0] // pac, 1, 1))
+        alpha = ops.tile(alpha, (1, pac, real_data.shape[1]))
+        alpha = alpha.view(-1, real_data.shape[1])
+
+        interpolates = alpha * real_data + ((1 - alpha) * fake_data)
+
+        grad_fn = grad(self.discriminator)
+
+        (gradients,) = grad_fn(interpolates)
+
+        gradients_view = gradients.view(-1, pac * real_data.shape[1])
+        gradients_view = mnp.norm(gradients_view, 2, 1) - 1
+        gradient_penalty = ((gradients_view) ** 2).mean() * lambda_
+
+        return gradient_penalty
+
+    def discriminator_forward(self, fakez, real, c1, c2):
+        _, fakeact = self.generator(fakez)
+        if c1 is not None:
+            fake_cat = mnp.concatenate([fakeact, c1], axis=1)
+            real_cat = mnp.concatenate([real, c2], axis=1)
+        else:
+            real_cat = real
+            fake_cat = fakeact
+
+        y_fake = self.discriminator(fake_cat)
+        y_real = self.discriminator(real_cat)
+
+        g_p = self.calc_gradient_penalty(real_cat, fake_cat, self.pac)
+        loss_d = -(ops.reduce_mean(y_real) - ops.reduce_mean(y_fake))            
+
+        c_loss = loss_d + g_p
+        if self.amp:
+            c_loss = self.loss_scale_D.scale(c_loss)
+        return c_loss, loss_d
+
+    def generator_forward(self, fake_z, c1, m1, cond_info):
+        fake, fakeact = self.generator(fake_z)
+
+        if c1 is not None:
+            y_fake = self.discriminator(mnp.concatenate([fakeact, c1], axis=1))
+        else:
+            y_fake = self.discriminator(fakeact)
+
+        if c1 is None:
+            cross_entropy = 0
+        else:
+            cross_entropy = conditional_loss(cond_info, fake, c1, m1)
+
+        loss_g = -ops.reduce_mean(y_fake) + cross_entropy
+        if self.amp:
+            loss_g = self.loss_scale_G.scale(loss_g)
+        return loss_g
 
     def fit(self, train_data, discrete_columns=()):
         self._validate_discrete_columns(train_data, discrete_columns)
@@ -45,106 +103,46 @@ class CTGANSynthesizer():
         train_data = self._transformer.transform(train_data)
         self._transformer.generate_tensors()
 
-        pac = self.pac
-
         self._data_sampler = DataSampler(train_data,
                                          self._transformer.output_info_list,
                                          self._log_frequency)
 
         data_dim = int(self._transformer.output_dimensions)
 
-        generator = Generator(self._embedding_dim + self._data_sampler.dim_cond_vec(),
-                                    self._generator_dim,
-                                    data_dim,
-                                    self._transformer.output_tensor,
-                                    tau=0.2)
-        generator.update_parameters_name('generator')
-        generator.set_train(True)
-
-        discriminator = Discriminator(data_dim + self._data_sampler.dim_cond_vec(),
+        self.generator = Generator(self._embedding_dim + self._data_sampler.dim_cond_vec(),
+                                   self._generator_dim,
+                                   data_dim,
+                                   self._transformer.output_tensor,
+                                   tau=0.2)
+        self.discriminator = Discriminator(data_dim + self._data_sampler.dim_cond_vec(),
                                       self._discriminator_dim,
                                       pac=self.pac)
-        discriminator.update_parameters_name('discriminator')
-        discriminator.set_train(True)
 
-        optimizer_G = nn.Adam(generator.trainable_params(),
+
+        if self.amp:
+            self.loss_scale_G = DynamicLossScale(1024, 2, 2000)
+            self.loss_scale_D = DynamicLossScale(1024, 2, 2000)
+            auto_mixed_precision(self.generator)
+            auto_mixed_precision(self.discriminator)
+        else:
+            self.loss_scale_G = NoLossScale()
+            self.loss_scale_D = NoLossScale()
+
+        self.generator.set_train(True)
+        self.discriminator.set_train(True)
+
+        self.optimizer_G = nn.Adam(self.generator.trainable_params(),
                               learning_rate=self._generator_lr,
                               beta1=0.5, beta2=0.9,
                               weight_decay=self._generator_decay)
-        optimizer_G.update_parameters_name('optimizer_G')
 
-        optimizer_D = nn.Adam(discriminator.trainable_params(),
+        self.optimizer_D = nn.Adam(self.discriminator.trainable_params(),
                               learning_rate=self._discriminator_lr,
                               beta1=0.5, beta2=0.9,
                               weight_decay=self._discriminator_decay)
-        optimizer_D.update_parameters_name('optimizer_D')
 
-        def calc_gradient_penalty(real_data, fake_data, pac=10, lambda_=10):
-            """Compute the gradient penalty."""
-            alpha = ops.StandardNormal()((real_data.shape[0] // pac, 1, 1))
-            alpha = ops.tile(alpha, (1, pac, real_data.shape[1]))
-            alpha = alpha.view(-1, real_data.shape[1])
-
-            interpolates = alpha * real_data + ((1 - alpha) * fake_data)
-
-            grad_fn = grad(discriminator)
-
-            (gradients,) = grad_fn(interpolates)
-
-            gradients_view = gradients.view(-1, pac * real_data.shape[1])
-            gradients_view = mnp.norm(gradients_view, 2, 1) - 1
-            gradient_penalty = ((gradients_view) ** 2).mean() * lambda_
-
-            return gradient_penalty
-
-        def discriminator_forward(fakez, real, c1, c2):
-            _, fakeact = generator(fakez)
-            if c1 is not None:
-                fake_cat = mnp.concatenate([fakeact, c1], axis=1)
-                real_cat = mnp.concatenate([real, c2], axis=1)
-            else:
-                real_cat = real
-                fake_cat = fakeact
-
-            y_fake = discriminator(fake_cat)
-            y_real = discriminator(real_cat)
-
-            g_p = calc_gradient_penalty(real_cat, fake_cat, pac)
-            loss_d = -(ops.reduce_mean(y_real) - ops.reduce_mean(y_fake))            
-
-            c_loss = loss_d + g_p
-            return c_loss, loss_d
-
-        def generator_forward(fake_z, c1, m1, cond_info):
-            fake, fakeact = generator(fake_z)
-
-            if c1 is not None:
-                y_fake = discriminator(mnp.concatenate([fakeact, c1], axis=1))
-            else:
-                y_fake = discriminator(fakeact)
-
-            if c1 is None:
-                cross_entropy = 0
-            else:
-                cross_entropy = conditional_loss(cond_info, fake, c1, m1)
-
-            loss_g = -ops.reduce_mean(y_fake) + cross_entropy
-            return loss_g
-
-        discriminator_grad_fn = value_and_grad(discriminator_forward, discriminator.trainable_params(), has_aux=True)
-        generator_grad_fn = value_and_grad(generator_forward, generator.trainable_params())
-
-        @ms_function
-        def train_discriminator(fakez, real, c1, c2):
-            (_, (loss_d,)), grads = discriminator_grad_fn(fakez, real, c1, c2)
-            optimizer_D(grads)
-            return loss_d
-
-        @ms_function
-        def train_generator(fake_z, c1, m1, cond_info):
-            loss_g, grads = generator_grad_fn(fake_z, c1, m1, cond_info)
-            optimizer_G(grads)
-            return loss_g
+        self.discriminator_grad_fn = value_and_grad(self.discriminator_forward, self.discriminator.trainable_params(), has_aux=True)
+        self.generator_grad_fn = value_and_grad(self.generator_forward, self.generator.trainable_params())
 
         steps_per_epoch = max(len(train_data) // self._batch_size, 1)
         for i in range(self._epochs):
@@ -174,7 +172,7 @@ class CTGANSynthesizer():
                     fakez = Tensor(fakez, mindspore.float32)
                     real = Tensor(real, mindspore.float32)
 
-                    loss_d = train_discriminator(fakez, real, c1, c2)
+                    loss_d = self.train_discriminator(fakez, real, c1, c2)
                     t_d = time.time()
                     cost_d += (t_d - s_d)
                 
@@ -194,15 +192,42 @@ class CTGANSynthesizer():
                 fakez = Tensor(fakez, mindspore.float32)
 
                 s_g = time.time()
-                loss_g = train_generator(fakez, c1, m1, self._transformer.cond_tensor)
+                loss_g = self.train_generator(fakez, c1, m1, self._transformer.cond_tensor)
                 t_g = time.time()
                 cost_g = t_g - s_g
 
-            if self._verbose:
-                print(f'Epoch {i+1}, Loss G: {loss_g.asnumpy(): .4f},'  # noqa: T001
-                      f'Loss D: {loss_d.asnumpy(): .4f}, '
-                      f'Cost D: {cost_d: .6f}, Cost G: {cost_g: .6f}',
-                      flush=True)
+                if self._verbose:
+                    print(f'Epoch {i+1}, Loss G: {loss_g.asnumpy(): .4f},'  # noqa: T001
+                        f'Loss D: {loss_d.asnumpy(): .4f}, '
+                        f'Cost D: {cost_d: .6f}, Cost G: {cost_g: .6f}',
+                        flush=True)
+
+    @ms_function
+    def train_discriminator(self, fakez, real, c1, c2):
+        (_, (loss_d,)), grads = self.discriminator_grad_fn(fakez, real, c1, c2)
+        if self.amp:
+            grads = self.loss_scale_D.unscale(grads)
+            grads_finite = all_finite(grads)
+            self.loss_scale_D.adjust(grads_finite)
+            if grads_finite:
+                self.optimizer_D(grads)
+        else:
+            self.optimizer_D(grads)
+        return loss_d
+
+    @ms_function
+    def train_generator(self, fake_z, c1, m1, cond_info):
+        loss_g, grads = self.generator_grad_fn(fake_z, c1, m1, cond_info)
+        if self.amp:
+            grads = self.loss_scale_G.unscale(grads)
+            loss_g = self.loss_scale_G.unscale(loss_g)
+            grads_finite = all_finite(grads)
+            self.loss_scale_G.adjust(grads_finite)
+            if grads_finite:
+                self.optimizer_G(grads)
+        else:
+            self.optimizer_G(grads)
+        return loss_g
 
     def sample(self, n, condiction_column, condition_value=None):
         pass
