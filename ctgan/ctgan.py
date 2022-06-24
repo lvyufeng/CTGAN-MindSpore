@@ -40,6 +40,10 @@ class CTGANSynthesizer(nn.Cell):
         self._data_sampler = None
         self._generator = None
 
+    def discriminator_with_loss_scale(self, inputs):
+        outputs = self.discriminator(inputs)
+        return self.loss_scale_D.scale(outputs)
+
     def calc_gradient_penalty(self, real_data, fake_data, pac=10, lambda_=10):
         """Compute the gradient penalty."""
         alpha = ops.StandardNormal()((real_data.shape[0] // pac, 1, 1))
@@ -48,9 +52,9 @@ class CTGANSynthesizer(nn.Cell):
 
         interpolates = alpha * real_data + ((1 - alpha) * fake_data)
 
-        grad_fn = grad(self.discriminator)
-
-        (gradients,) = grad_fn(interpolates)
+        (gradients,) = self.grad_fn(interpolates)
+        if self.amp:
+            gradients = self.loss_scale_D.unscale(gradients)
 
         gradients_view = gradients.view(-1, pac * real_data.shape[1])
         gradients_view = mnp.norm(gradients_view, 2, 1) - 1
@@ -124,9 +128,6 @@ class CTGANSynthesizer(nn.Cell):
             self.loss_scale_D = DynamicLossScale(1024, 2, 2000)
             auto_mixed_precision(self.generator)
             auto_mixed_precision(self.discriminator)
-        else:
-            self.loss_scale_G = NoLossScale()
-            self.loss_scale_D = NoLossScale()
 
         self.generator.set_train(True)
         self.discriminator.set_train(True)
@@ -143,6 +144,10 @@ class CTGANSynthesizer(nn.Cell):
 
         self.discriminator_grad_fn = value_and_grad(self.discriminator_forward, self.discriminator.trainable_params(), has_aux=True)
         self.generator_grad_fn = value_and_grad(self.generator_forward, self.generator.trainable_params())
+        if self.amp:
+            self.grad_fn = grad(self.discriminator_with_loss_scale)
+        else:
+            self.grad_fn = grad(self.discriminator)
 
         steps_per_epoch = max(len(train_data) // self._batch_size, 1)
         for i in range(self._epochs):
@@ -206,11 +211,11 @@ class CTGANSynthesizer(nn.Cell):
     def train_discriminator(self, fakez, real, c1, c2):
         (_, (loss_d,)), grads = self.discriminator_grad_fn(fakez, real, c1, c2)
         if self.amp:
-            grads = self.loss_scale_D.unscale(grads)
             grads_finite = all_finite(grads)
             self.loss_scale_D.adjust(grads_finite)
             if grads_finite:
-                self.optimizer_D(grads)
+                grads = self.loss_scale_D.unscale(grads)
+                loss_d = ops.depend(loss_d, self.optimizer_D(grads))
         else:
             self.optimizer_D(grads)
         return loss_d
@@ -219,12 +224,12 @@ class CTGANSynthesizer(nn.Cell):
     def train_generator(self, fake_z, c1, m1, cond_info):
         loss_g, grads = self.generator_grad_fn(fake_z, c1, m1, cond_info)
         if self.amp:
-            grads = self.loss_scale_G.unscale(grads)
             loss_g = self.loss_scale_G.unscale(loss_g)
             grads_finite = all_finite(grads)
             self.loss_scale_G.adjust(grads_finite)
             if grads_finite:
-                self.optimizer_G(grads)
+                grads = self.loss_scale_G.unscale(grads)
+                loss_g = ops.depend(loss_g, self.optimizer_G(grads))
         else:
             self.optimizer_G(grads)
         return loss_g
