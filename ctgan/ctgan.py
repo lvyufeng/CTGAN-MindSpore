@@ -5,7 +5,8 @@ import mindspore
 import mindspore.nn as nn
 import mindspore.ops as ops
 import mindspore.numpy as mnp
-from mindspore import Tensor, ms_function
+from packaging import version
+from mindspore import ParameterTuple, Tensor, ms_function
 from .data_modules import DataTransformer, DataSampler
 from .modules import Generator, Discriminator, conditional_loss
 from .grad import value_and_grad, grad
@@ -142,8 +143,15 @@ class CTGANSynthesizer(nn.Cell):
                               beta1=0.5, beta2=0.9,
                               weight_decay=self._discriminator_decay)
 
-        self.discriminator_grad_fn = value_and_grad(self.discriminator_forward, self.discriminator.trainable_params(), has_aux=True)
-        self.generator_grad_fn = value_and_grad(self.generator_forward, self.generator.trainable_params())
+        if version.parse(mindspore.__version__) < version.parse('1.8.0'):
+            d_params = ParameterTuple(self.discriminator.trainable_params())
+            g_params = ParameterTuple(self.generator.trainable_params())
+        else:
+            d_params = self.discriminator.trainable_params()
+            g_params = self.generator.trainable_params()
+
+        self.discriminator_grad_fn = value_and_grad(self.discriminator_forward, d_params, has_aux=True)
+        self.generator_grad_fn = value_and_grad(self.generator_forward, g_params)
         if self.amp:
             self.grad_fn = grad(self.discriminator_with_loss_scale)
         else:

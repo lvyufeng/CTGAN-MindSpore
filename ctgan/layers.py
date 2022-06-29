@@ -3,6 +3,7 @@ import mindspore.nn as nn
 import mindspore.ops as ops
 import mindspore.numpy as mnp
 from mindspore.common.initializer import initializer, Normal, Uniform, HeUniform, _calculate_fan_in_and_fan_out
+from mindspore.ops import constexpr
 
 class Dense(nn.Dense):
     def __init__(self, in_channels, out_channels, has_bias=True, activation=None):
@@ -48,14 +49,22 @@ class ApplyActivation(nn.Cell):
         # data_t = ops.zeros_like(outputs)
         data_list = ()
         for idx in self.transformer_info:
+            idx_0, idx_1 = get_idx(idx)
             if idx[2] == 0:
-                act = self.tanh(outputs[:, idx[0]:idx[1]])
+                act = self.tanh(outputs[:, idx_0:idx_1])
             else:
-                act = gumbel_softmax(outputs[:, idx[0]:idx[1]], temperature=self.tau)
+                act = gumbel_softmax(outputs[:, idx_0:idx_1], temperature=self.tau)
             # data_t = ops.Concat(1)([data_t[:, :idx[0]], act, data_t[:, idx[1]:]])
             data_list += (act,)
         data_t = mnp.concatenate(data_list, 1)
         return outputs, data_t
+
+"""
+For MindSpore 1.7, the index should be transformed from int to int
+"""
+@constexpr
+def get_idx(idx):
+    return int(idx[0]), int(idx[1])
 
 def gumbel_softmax(logits, temperature, hard=False, axis=-1, eps=1e-10):
     uniform_samples = ops.UniformReal()(logits.shape)
